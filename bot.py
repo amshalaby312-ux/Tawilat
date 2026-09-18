@@ -45,6 +45,10 @@ def db():
         conn.close()
 
 
+def _column_exists(conn, table, column):
+    return any(row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
 def init_db():
     with db() as conn:
         conn.execute(
@@ -54,8 +58,17 @@ def init_db():
                 full_name TEXT NOT NULL,
                 username TEXT,
                 current_group INTEGER NOT NULL,
-                desired_group INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'searching'  -- searching | matched
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS desired_groups (
+                user_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, group_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
             )
             """
         )
@@ -72,6 +85,35 @@ def init_db():
             """
         )
 
+        # One-time migration from the old single-desired-group schema.
+        if _column_exists(conn, "users", "desired_group"):
+            rows = conn.execute("SELECT user_id, desired_group FROM users").fetchall()
+            for row in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO desired_groups (user_id, group_id) VALUES (?, ?)",
+                    (row["user_id"], row["desired_group"]),
+                )
+            conn.execute("ALTER TABLE users RENAME TO users_old")
+            conn.execute(
+                """
+                CREATE TABLE users (
+                    user_id INTEGER PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    username TEXT,
+                    current_group INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'searching'
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO users (user_id, full_name, username, current_group, status)
+                SELECT user_id, full_name, username, current_group, status FROM users_old
+                """
+            )
+            conn.execute("DROP TABLE users_old")
+            logger.info("Migrated users.desired_group into the desired_groups table.")
+
 
 def get_user(user_id):
     with db() as conn:
@@ -80,20 +122,34 @@ def get_user(user_id):
         ).fetchone()
 
 
-def upsert_user(user_id, full_name, username, current_group, desired_group):
+def get_desired_groups(user_id):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT group_id FROM desired_groups WHERE user_id = ? ORDER BY group_id",
+            (user_id,),
+        ).fetchall()
+    return [r["group_id"] for r in rows]
+
+
+def upsert_user(user_id, full_name, username, current_group, desired_groups):
+    """desired_groups: an iterable of one or more group numbers the user wants."""
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO users (user_id, full_name, username, current_group, desired_group, status)
-            VALUES (?, ?, ?, ?, ?, 'searching')
+            INSERT INTO users (user_id, full_name, username, current_group, status)
+            VALUES (?, ?, ?, ?, 'searching')
             ON CONFLICT(user_id) DO UPDATE SET
                 full_name=excluded.full_name,
                 username=excluded.username,
                 current_group=excluded.current_group,
-                desired_group=excluded.desired_group,
                 status='searching'
             """,
-            (user_id, full_name, username, current_group, desired_group),
+            (user_id, full_name, username, current_group),
+        )
+        conn.execute("DELETE FROM desired_groups WHERE user_id = ?", (user_id,))
+        conn.executemany(
+            "INSERT INTO desired_groups (user_id, group_id) VALUES (?, ?)",
+            [(user_id, g) for g in desired_groups],
         )
 
 
@@ -107,18 +163,33 @@ def delete_user(user_id):
         conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
 
-def find_reverse_candidates(user_id, current_group, desired_group):
-    """Other active users whose swap is the exact mirror of this one."""
+def all_searching_users():
     with db() as conn:
         return conn.execute(
-            """
-            SELECT * FROM users
-            WHERE status = 'searching'
-              AND user_id != ?
-              AND current_group = ?
-              AND desired_group = ?
+            "SELECT * FROM users WHERE status = 'searching' ORDER BY current_group, full_name"
+        ).fetchall()
+
+
+def find_reverse_candidates(user_id, current_group, desired_groups):
+    """Other active users whose current group is one this user wants, and who
+    in turn want this user's current group — i.e. a real, mutual swap."""
+    if not desired_groups:
+        return []
+    placeholders = ",".join("?" * len(desired_groups))
+    with db() as conn:
+        return conn.execute(
+            f"""
+            SELECT DISTINCT u.*
+            FROM users u
+            WHERE u.status = 'searching'
+              AND u.user_id != ?
+              AND u.current_group IN ({placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM desired_groups dg
+                  WHERE dg.user_id = u.user_id AND dg.group_id = ?
+              )
             """,
-            (user_id, desired_group, current_group),
+            (user_id, *desired_groups, current_group),
         ).fetchall()
 
 
@@ -189,6 +260,7 @@ def cancel_other_pending_matches(user_id, except_match_id):
 # ---------------------------------------------------------------------------
 
 def group_keyboard(prefix, exclude=None):
+    """Single-select keyboard (used for the 'current group' step)."""
     buttons = []
     row = []
     for g in GROUPS:
@@ -203,6 +275,25 @@ def group_keyboard(prefix, exclude=None):
     return InlineKeyboardMarkup(buttons)
 
 
+def desired_group_keyboard(selected, exclude=None):
+    """Multi-select toggle keyboard (used for the 'desired groups' step)."""
+    buttons = []
+    row = []
+    for g in GROUPS:
+        if g == exclude:
+            continue
+        label = f"✅ G{g}" if g in selected else f"G{g}"
+        row.append(InlineKeyboardButton(label, callback_data=f"des:{g}"))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    done_label = "➡️ Done" if selected else "➡️ Select at least one group"
+    buttons.append([InlineKeyboardButton(done_label, callback_data="des:done")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def mention(full_name, user_id, username):
     text = f'<a href="tg://user?id={user_id}">{full_name}</a>'
     if username:
@@ -210,12 +301,16 @@ def mention(full_name, user_id, username):
     return text
 
 
-def status_text(user_row):
+def groups_str(group_list):
+    return ", ".join(f"G{g}" for g in group_list) if group_list else "—"
+
+
+def status_text(user_row, desired_groups):
     return (
         f"📋 Your listing:\n"
         f"Name: {user_row['full_name']}\n"
         f"Current group: G{user_row['current_group']}\n"
-        f"Wants to move to: G{user_row['desired_group']}\n"
+        f"Wants to move to: {groups_str(desired_groups)}\n"
         f"Status: {'🔎 searching' if user_row['status'] == 'searching' else '✅ matched'}"
     )
 
@@ -227,6 +322,7 @@ def status_text(user_row):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_row = get_user(update.effective_user.id)
     if user_row and user_row["status"] == "searching":
+        desired_groups = get_desired_groups(update.effective_user.id)
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("✏️ Edit my listing", callback_data="menu:edit")],
@@ -234,7 +330,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
         await update.message.reply_text(
-            status_text(user_row) + "\n\nWhat would you like to do?",
+            status_text(user_row, desired_groups) + "\n\nWhat would you like to do?",
             reply_markup=keyboard,
         )
         return ConversationHandler.END
@@ -290,35 +386,55 @@ async def ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     group = int(query.data.split(":")[1])
     context.user_data["current_group"] = group
+    context.user_data["desired_groups"] = set()
 
     await query.edit_message_text(
-        f"Current group set to G{group}.\n\nWhich group do you want to move to?",
-        reply_markup=group_keyboard("des", exclude=group),
+        f"Current group set to G{group}.\n\n"
+        f"Which group(s) do you want to move to? Tap as many as you like, then tap Done.",
+        reply_markup=desired_group_keyboard(set(), exclude=group),
     )
     return ASK_DESIRED
 
 
 async def ask_desired(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    desired_group = int(query.data.split(":")[1])
+    data = query.data.split(":")[1]
     current_group = context.user_data["current_group"]
-    full_name = context.user_data["full_name"]
+    selected = context.user_data.setdefault("desired_groups", set())
 
-    user = query.from_user
-    upsert_user(user.id, full_name, user.username, current_group, desired_group)
+    if data == "done":
+        if not selected:
+            await query.answer("Select at least one group first.", show_alert=True)
+            return ASK_DESIRED
 
-    await query.edit_message_text(
-        f"✅ You're registered:\n{full_name}\nG{current_group} ➜ G{desired_group}\n\n"
-        f"I'll notify you the moment someone wants the opposite swap.\n"
-        f"Use /mystatus anytime to check, or /cancel to withdraw."
-    )
+        await query.answer()
+        desired_groups = sorted(selected)
+        full_name = context.user_data["full_name"]
+        user = query.from_user
+        upsert_user(user.id, full_name, user.username, current_group, desired_groups)
 
-    await notify_matches(context, user.id, full_name, user.username, current_group, desired_group)
-    return ConversationHandler.END
+        await query.edit_message_text(
+            f"✅ You're registered:\n{full_name}\nG{current_group} ➜ {groups_str(desired_groups)}\n\n"
+            f"I'll notify you the moment someone wants a matching swap.\n"
+            f"Use /mystatus anytime to check, or /cancel to withdraw."
+        )
+
+        await notify_matches(context, user.id, full_name, user.username, current_group, desired_groups)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    g = int(data)
+    if g in selected:
+        selected.discard(g)
+    else:
+        selected.add(g)
+    await query.answer()
+    await query.edit_message_reply_markup(desired_group_keyboard(selected, exclude=current_group))
+    return ASK_DESIRED
 
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     await update.message.reply_text("Registration cancelled. Send /start to try again.")
     return ConversationHandler.END
 
@@ -327,36 +443,40 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Matching
 # ---------------------------------------------------------------------------
 
-async def notify_matches(context, user_id, full_name, username, current_group, desired_group):
-    candidates = find_reverse_candidates(user_id, current_group, desired_group)
+async def notify_matches(context, user_id, full_name, username, current_group, desired_groups):
+    candidates = find_reverse_candidates(user_id, current_group, desired_groups)
     for cand in candidates:
         if existing_pending_match(user_id, cand["user_id"]):
             continue
+        cand_desired = get_desired_groups(cand["user_id"])
         match_id = create_match(user_id, cand["user_id"])
         await send_match_notification(
             context, match_id,
             to_user_id=cand["user_id"],
             other_full_name=full_name, other_user_id=user_id, other_username=username,
-            other_from_group=current_group, other_to_group=desired_group,
+            other_from_group=current_group, other_to_groups=desired_groups,
         )
         await send_match_notification(
             context, match_id,
             to_user_id=user_id,
             other_full_name=cand["full_name"], other_user_id=cand["user_id"], other_username=cand["username"],
-            other_from_group=cand["current_group"], other_to_group=cand["desired_group"],
+            other_from_group=cand["current_group"], other_to_groups=cand_desired,
         )
 
 
 async def send_match_notification(context, match_id, to_user_id, other_full_name, other_user_id,
-                                     other_username, other_from_group, other_to_group):
+                                     other_username, other_from_group, other_to_groups):
     text = (
         "🎉 <b>Match found!</b>\n\n"
         f"{mention(other_full_name, other_user_id, other_username)} is in G{other_from_group} "
-        f"and wants to move to G{other_to_group} — the exact opposite of your swap.\n\n"
+        f"and wants to move to {groups_str(other_to_groups)} — that overlaps with your swap.\n\n"
         "Tap the name above to message them, then confirm below once you've agreed to swap."
     )
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Confirm swap", callback_data=f"confirm:{match_id}")]]
+        [
+            [InlineKeyboardButton("✅ Confirm swap", callback_data=f"confirm:{match_id}")],
+            [InlineKeyboardButton("❌ Cancel this match", callback_data=f"cancel:{match_id}")],
+        ]
     )
     try:
         await context.bot.send_message(
@@ -422,11 +542,47 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_reply_markup(
                 InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⏳ Waiting for the other person...", callback_data="noop")]]
+                    [
+                        [InlineKeyboardButton("⏳ Waiting for the other person...", callback_data="noop")],
+                        [InlineKeyboardButton("❌ Cancel this match", callback_data=f"cancel:{match_id}")],
+                    ]
                 )
             )
         except Exception:
             pass
+
+
+async def cancel_match_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    match_id = int(query.data.split(":")[1])
+    match_row = get_match(match_id)
+
+    if not match_row or match_row["status"] != "pending":
+        await query.answer("This match is no longer available.", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    if user_id not in (match_row["user_a"], match_row["user_b"]):
+        await query.answer("This isn't your match.", show_alert=True)
+        return
+
+    set_match_status(match_id, "cancelled")
+    await query.answer("Match cancelled.")
+
+    try:
+        await query.edit_message_text("❌ You cancelled this match. Still listed — we'll keep looking for others.")
+    except Exception:
+        pass
+
+    other_id = match_row["user_b"] if match_row["user_a"] == user_id else match_row["user_a"]
+    try:
+        await context.bot.send_message(
+            chat_id=other_id,
+            text="ℹ️ The other person cancelled this match. You're still listed — "
+                 "we'll keep looking for other matches. Send /mystatus to check anytime.",
+        )
+    except Exception:
+        logger.exception("Could not notify %s of cancellation", other_id)
 
 
 def _ghost(user_id):
@@ -438,7 +594,7 @@ async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Status / cancel commands
+# Status / cancel / waitlist commands
 # ---------------------------------------------------------------------------
 
 async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -446,8 +602,9 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_row:
         await update.message.reply_text("You don't have an active listing. Send /start to register.")
         return
+    desired_groups = get_desired_groups(update.effective_user.id)
     pending = pending_matches_for_user(update.effective_user.id)
-    text = status_text(user_row)
+    text = status_text(user_row, desired_groups)
     if user_row["status"] == "searching":
         text += f"\n\nPending potential matches: {len(pending)}"
     await update.message.reply_text(text)
@@ -462,10 +619,38 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Your listing has been withdrawn. Send /start anytime to register again.")
 
 
+async def waitlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = all_searching_users()
+    if not users:
+        await update.message.reply_text("No one is currently waiting for a swap. 🎉")
+        return
+
+    lines = []
+    for u in users:
+        desired = get_desired_groups(u["user_id"])
+        lines.append(
+            f"• {mention(u['full_name'], u['user_id'], u['username'])} — G{u['current_group']} ➜ {groups_str(desired)}"
+        )
+
+    header = f"📋 <b>Current wait list</b> ({len(users)} waiting)\n\n"
+    chunk = [header]
+    length = len(header)
+    for line in lines:
+        if length + len(line) + 1 > 3800:
+            await update.message.reply_text("".join(chunk), parse_mode=ParseMode.HTML)
+            chunk = []
+            length = 0
+        chunk.append(line + "\n")
+        length += len(line) + 1
+    if chunk:
+        await update.message.reply_text("".join(chunk), parse_mode=ParseMode.HTML)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start — register or update your swap request\n"
         "/mystatus — check your current listing\n"
+        "/waitlist — see everyone currently waiting for a swap\n"
         "/cancel — withdraw your listing\n"
         "/help — this message"
     )
@@ -484,7 +669,7 @@ def main():
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
             ASK_CURRENT: [CallbackQueryHandler(ask_current, pattern=r"^cur:\d+$")],
-            ASK_DESIRED: [CallbackQueryHandler(ask_desired, pattern=r"^des:\d+$")],
+            ASK_DESIRED: [CallbackQueryHandler(ask_desired, pattern=r"^des:(\d+|done)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
         per_message=False,
@@ -493,9 +678,11 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:\d+$"))
+    app.add_handler(CallbackQueryHandler(cancel_match_callback, pattern=r"^cancel:\d+$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
     app.add_handler(CommandHandler("mystatus", mystatus))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("waitlist", waitlist_command))
     app.add_handler(CommandHandler("help", help_command))
 
     logger.info("Bot starting...")
