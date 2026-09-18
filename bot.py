@@ -327,6 +327,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 [InlineKeyboardButton("✏️ Edit my listing", callback_data="menu:edit")],
                 [InlineKeyboardButton("❌ Cancel my listing", callback_data="menu:cancel")],
+                [InlineKeyboardButton("📋 Waitlist", callback_data="menu:waitlist")],
             ]
         )
         await update.message.reply_text(
@@ -337,7 +338,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_row and user_row["status"] == "matched":
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔁 Register a new swap", callback_data="menu:edit")]]
+            [
+                [InlineKeyboardButton("🔁 Register a new swap", callback_data="menu:edit")],
+                [InlineKeyboardButton("📋 Waitlist", callback_data="menu:waitlist")],
+            ]
         )
         await update.message.reply_text(
             "You already completed a confirmed swap. Want to register a new one?",
@@ -366,6 +370,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "edit":
         await query.edit_message_text("Okay! What's your full name?")
         return ASK_NAME
+
+    if action == "waitlist":
+        await send_waitlist(query.message.chat_id, context)
+        return
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -619,10 +627,12 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Your listing has been withdrawn. Send /start anytime to register again.")
 
 
-async def waitlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_waitlist(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """Builds and sends the current wait list to chat_id, splitting into multiple
+    messages if the content would exceed Telegram's ~4096 character limit."""
     users = all_searching_users()
     if not users:
-        await update.message.reply_text("No one is currently waiting for a swap. 🎉")
+        await context.bot.send_message(chat_id=chat_id, text="No one is currently waiting for a swap. 🎉")
         return
 
     lines = []
@@ -637,13 +647,17 @@ async def waitlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     length = len(header)
     for line in lines:
         if length + len(line) + 1 > 3800:
-            await update.message.reply_text("".join(chunk), parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id=chat_id, text="".join(chunk), parse_mode=ParseMode.HTML)
             chunk = []
             length = 0
         chunk.append(line + "\n")
         length += len(line) + 1
     if chunk:
-        await update.message.reply_text("".join(chunk), parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=chat_id, text="".join(chunk), parse_mode=ParseMode.HTML)
+
+
+async def waitlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_waitlist(update.effective_chat.id, context)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
