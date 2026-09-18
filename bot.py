@@ -424,7 +424,10 @@ async def ask_desired(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ You're registered:\n{full_name}\nG{current_group} ➜ {groups_str(desired_groups)}\n\n"
             f"I'll notify you the moment someone wants a matching swap.\n"
-            f"Use /mystatus anytime to check, or /cancel to withdraw."
+            f"Use /mystatus anytime to check, or /cancel to withdraw.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📋 Waitlist", callback_data="menu:waitlist")]]
+            ),
         )
 
         await notify_matches(context, user.id, full_name, user.username, current_group, desired_groups)
