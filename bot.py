@@ -33,7 +33,7 @@ GROUPS = [f"{n}{sub}" for n in range(1, 9) for sub in ("a", "b")]  # G1a, G1b, G
 # Backup / restore
 # ---------------------------------------------------------------------------
 BACKUP_CHANNEL_ID = -1002891277206
-BACKUP_INTERVAL_SECONDS = 60
+BACKUP_INTERVAL_SECONDS = 10
 BACKUP_FILENAME = "swaps_backup.json"
 ADMIN_IDS = {
     int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "940770584").split(",") if uid.strip()
@@ -539,7 +539,7 @@ def build_available_swaps(user_id):
     if not row or row["status"] != "searching":
         return None, None
 
-    desired_groups = [d["group_id"] for d in get_desired_groups(user_id)]
+    desired_groups = get_desired_groups(user_id)
     mutual = find_reverse_candidates(user_id, row["current_group"], desired_groups)
     mutual_ids = {c["user_id"] for c in mutual}
 
@@ -562,7 +562,7 @@ def build_available_swaps(user_id):
 
     if alternatives:
         lines.append(
-            "🔁 <b>Alternative swaps</b> — you didn't ask for these, but they are alternatives:"
+            "🔁 <b>Alternative swaps</b> — you didn't ask for these, but they want your spot:"
         )
         for u in alternatives:
             lines.append(f"• {mention(u['full_name'], u['user_id'], u['username'])} — has G{u['current_group']}")
@@ -577,14 +577,16 @@ def build_available_swaps(user_id):
     if others:
         lines.append("👀 <b>Also currently holding a group you want</b> (not seeking your spot yet):")
         for u in others:
-            u_desired = groups_str([d["group_id"] for d in get_desired_groups(u["user_id"])])
+            u_desired = groups_str(get_desired_groups(u["user_id"]))
             lines.append(
                 f"• {mention(u['full_name'], u['user_id'], u['username'])} — has G{u['current_group']}, wants {u_desired}"
             )
         lines.append("")
 
     if not mutual and not alternatives and not others:
-        lines.append("Nothing available right now — you'll be notified the moment a match appears.")
+        waiting_count = len(all_searching_users())
+        lines.append("there are no alternative groups currently, Sorry :/")
+        lines.append(f"current number of people waiting: {waiting_count}")
 
     text = "\n".join(lines).strip()
     keyboard = InlineKeyboardMarkup(buttons) if buttons else None
@@ -799,7 +801,7 @@ async def propose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("That person is no longer available.", show_alert=True)
         return
 
-    other_desired = [d["group_id"] for d in get_desired_groups(other_id)]
+    other_desired = get_desired_groups(other_id)
     if me["current_group"] not in other_desired:
         await query.answer("They no longer want your group.", show_alert=True)
         return
@@ -809,7 +811,7 @@ async def propose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer("Proposal sent!")
-    my_desired = [d["group_id"] for d in get_desired_groups(user_id)]
+    my_desired = get_desired_groups(user_id)
     match_id = create_match(user_id, other_id)
 
     await send_match_notification(
