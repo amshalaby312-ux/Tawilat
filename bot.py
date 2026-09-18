@@ -33,7 +33,7 @@ GROUPS = [f"{n}{sub}" for n in range(1, 9) for sub in ("a", "b")]  # G1a, G1b, G
 # Backup / restore
 # ---------------------------------------------------------------------------
 BACKUP_CHANNEL_ID = -1002891277206
-BACKUP_INTERVAL_SECONDS = 10
+BACKUP_INTERVAL_SECONDS = 60
 BACKUP_FILENAME = "swaps_backup.json"
 ADMIN_IDS = {
     int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "940770584").split(",") if uid.strip()
@@ -562,7 +562,7 @@ def build_available_swaps(user_id):
 
     if alternatives:
         lines.append(
-            "🔁 <b>Alternative swaps</b> — you didn't ask for these, but they want your spot:"
+            "🔁 <b>Alternative swaps</b> — you didn't ask for these, but they are alternatives:"
         )
         for u in alternatives:
             lines.append(f"• {mention(u['full_name'], u['user_id'], u['username'])} — has G{u['current_group']}")
