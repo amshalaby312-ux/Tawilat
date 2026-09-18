@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "swaps.db")
-GROUPS = list(range(1, 9))  # G1..G8
+GROUPS = [f"{n}{sub}" for n in range(1, 9) for sub in ("a", "b")]  # G1a, G1b, G2a, G2b, ... G8a, G8b
 
 # Conversation states
 ASK_NAME, ASK_CURRENT, ASK_DESIRED = range(3)
@@ -57,7 +57,7 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 full_name TEXT NOT NULL,
                 username TEXT,
-                current_group INTEGER NOT NULL,
+                current_group TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'searching'  -- searching | matched
             )
             """
@@ -66,7 +66,7 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS desired_groups (
                 user_id INTEGER NOT NULL,
-                group_id INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
                 PRIMARY KEY (user_id, group_id),
                 FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
             )
@@ -100,7 +100,7 @@ def init_db():
                     user_id INTEGER PRIMARY KEY,
                     full_name TEXT NOT NULL,
                     username TEXT,
-                    current_group INTEGER NOT NULL,
+                    current_group TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'searching'
                 )
                 """
@@ -392,7 +392,7 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    group = int(query.data.split(":")[1])
+    group = query.data.split(":")[1]
     context.user_data["current_group"] = group
     context.user_data["desired_groups"] = set()
 
@@ -434,7 +434,7 @@ async def ask_desired(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-    g = int(data)
+    g = data
     if g in selected:
         selected.discard(g)
     else:
@@ -685,8 +685,8 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-            ASK_CURRENT: [CallbackQueryHandler(ask_current, pattern=r"^cur:\d+$")],
-            ASK_DESIRED: [CallbackQueryHandler(ask_desired, pattern=r"^des:(\d+|done)$")],
+            ASK_CURRENT: [CallbackQueryHandler(ask_current, pattern=r"^cur:[1-8][ab]$")],
+            ASK_DESIRED: [CallbackQueryHandler(ask_desired, pattern=r"^des:([1-8][ab]|done)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
         per_message=False,
