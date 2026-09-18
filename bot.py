@@ -1,3 +1,5 @@
+import asyncio
+import html
 import json
 import logging
 import os
@@ -202,6 +204,45 @@ def find_reverse_candidates(user_id, current_group, desired_groups):
               )
             """,
             (user_id, *desired_groups, current_group),
+        ).fetchall()
+
+
+def find_reciprocal_seekers(user_id, current_group):
+    """Any other searching user who wants this user's current group — even if
+    their own group wasn't one this user originally asked for. This is what
+    surfaces 'alternative' swaps: e.g. you want G2 (empty) but someone in G3,
+    which you never listed, wants your G1 — that's a real swap worth showing."""
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT DISTINCT u.*
+            FROM users u
+            JOIN desired_groups dg ON dg.user_id = u.user_id
+            WHERE u.status = 'searching'
+              AND u.user_id != ?
+              AND dg.group_id = ?
+            ORDER BY u.current_group, u.full_name
+            """,
+            (user_id, current_group),
+        ).fetchall()
+
+
+def users_in_groups(exclude_user_id, group_ids):
+    """Other searching users currently in any of the given groups, regardless of
+    whether they want ours back — used for the informational /available_swaps view."""
+    if not group_ids:
+        return []
+    placeholders = ",".join("?" * len(group_ids))
+    with db() as conn:
+        return conn.execute(
+            f"""
+            SELECT * FROM users
+            WHERE status = 'searching'
+              AND user_id != ?
+              AND current_group IN ({placeholders})
+            ORDER BY current_group, full_name
+            """,
+            (exclude_user_id, *group_ids),
         ).fetchall()
 
 
@@ -490,6 +531,66 @@ def status_text(user_row, desired_groups):
     )
 
 
+def build_available_swaps(user_id):
+    """Build an 'Available Swaps' summary for this user's current group, plus an
+    inline keyboard of 🔁 propose buttons for alternative swaps. Returns
+    (text, keyboard_or_None), or (None, None) if the user isn't an active listing."""
+    row = get_user(user_id)
+    if not row or row["status"] != "searching":
+        return None, None
+
+    desired_groups = [d["group_id"] for d in get_desired_groups(user_id)]
+    mutual = find_reverse_candidates(user_id, row["current_group"], desired_groups)
+    mutual_ids = {c["user_id"] for c in mutual}
+
+    reciprocal = find_reciprocal_seekers(user_id, row["current_group"])
+    alternatives = [
+        u for u in reciprocal
+        if u["user_id"] not in mutual_ids and u["current_group"] not in desired_groups
+    ]
+
+    others = [u for u in users_in_groups(user_id, desired_groups) if u["user_id"] not in mutual_ids]
+
+    lines = [f"🔄 <b>Available swaps for G{row['current_group']} ➜ {groups_str(desired_groups)}</b>", ""]
+    buttons = []
+
+    if mutual:
+        lines.append("✅ <b>Direct matches</b> — they want your spot too:")
+        for c in mutual:
+            lines.append(f"• {mention(c['full_name'], c['user_id'], c['username'])} — has G{c['current_group']}")
+        lines.append("")
+
+    if alternatives:
+        lines.append(
+            "🔁 <b>Alternative swaps</b> — you didn't ask for these, but they want your spot:"
+        )
+        for u in alternatives:
+            lines.append(f"• {mention(u['full_name'], u['user_id'], u['username'])} — has G{u['current_group']}")
+            buttons.append(
+                [InlineKeyboardButton(
+                    f"🔁 Propose swap into G{u['current_group']} ({u['full_name']})",
+                    callback_data=f"propose:{u['user_id']}",
+                )]
+            )
+        lines.append("")
+
+    if others:
+        lines.append("👀 <b>Also currently holding a group you want</b> (not seeking your spot yet):")
+        for u in others:
+            u_desired = groups_str([d["group_id"] for d in get_desired_groups(u["user_id"])])
+            lines.append(
+                f"• {mention(u['full_name'], u['user_id'], u['username'])} — has G{u['current_group']}, wants {u_desired}"
+            )
+        lines.append("")
+
+    if not mutual and not alternatives and not others:
+        lines.append("Nothing available right now — you'll be notified the moment a match appears.")
+
+    text = "\n".join(lines).strip()
+    keyboard = InlineKeyboardMarkup(buttons) if buttons else None
+    return text, keyboard
+
+
 # ---------------------------------------------------------------------------
 # Registration conversation
 # ---------------------------------------------------------------------------
@@ -509,6 +610,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_text(user_row, desired_groups) + "\n\nWhat would you like to do?",
             reply_markup=keyboard,
         )
+        swaps_text, swaps_keyboard = build_available_swaps(update.effective_user.id)
+        if swaps_text:
+            await update.message.reply_text(swaps_text, parse_mode=ParseMode.HTML, reply_markup=swaps_keyboard)
         return ConversationHandler.END
 
     if user_row and user_row["status"] == "matched":
@@ -606,6 +710,13 @@ async def ask_desired(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await notify_matches(context, user.id, full_name, user.username, current_group, desired_groups)
+
+        swaps_text, swaps_keyboard = build_available_swaps(user.id)
+        if swaps_text:
+            await context.bot.send_message(
+                chat_id=user.id, text=swaps_text, parse_mode=ParseMode.HTML, reply_markup=swaps_keyboard
+            )
+
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -670,6 +781,49 @@ async def send_match_notification(context, match_id, to_user_id, other_full_name
         )
     except Exception:
         logger.exception("Could not message user %s about match %s", to_user_id, match_id)
+
+
+async def propose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fired when a user taps a 🔁 button on an alternative swap surfaced by
+    /available_swaps — creates a real pending match, same as an automatic one."""
+    query = update.callback_query
+    other_id = int(query.data.split(":")[1])
+    user_id = query.from_user.id
+
+    me = get_user(user_id)
+    other = get_user(other_id)
+    if not me or me["status"] != "searching":
+        await query.answer("Your listing is no longer active.", show_alert=True)
+        return
+    if not other or other["status"] != "searching":
+        await query.answer("That person is no longer available.", show_alert=True)
+        return
+
+    other_desired = [d["group_id"] for d in get_desired_groups(other_id)]
+    if me["current_group"] not in other_desired:
+        await query.answer("They no longer want your group.", show_alert=True)
+        return
+
+    if existing_pending_match(user_id, other_id):
+        await query.answer("You already have a pending match with them — check your messages.", show_alert=True)
+        return
+
+    await query.answer("Proposal sent!")
+    my_desired = [d["group_id"] for d in get_desired_groups(user_id)]
+    match_id = create_match(user_id, other_id)
+
+    await send_match_notification(
+        context, match_id,
+        to_user_id=other_id,
+        other_full_name=me["full_name"], other_user_id=user_id, other_username=me["username"],
+        other_from_group=me["current_group"], other_to_groups=my_desired,
+    )
+    await send_match_notification(
+        context, match_id,
+        to_user_id=user_id,
+        other_full_name=other["full_name"], other_user_id=other_id, other_username=other["username"],
+        other_from_group=other["current_group"], other_to_groups=other_desired,
+    )
 
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -838,15 +992,66 @@ async def waitlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_waitlist(update.effective_chat.id, context)
 
 
+async def available_swaps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    swaps_text, swaps_keyboard = build_available_swaps(update.effective_user.id)
+    if swaps_text is None:
+        await update.message.reply_text(
+            "You don't have an active listing to check swaps for. Send /start to register."
+        )
+        return
+    await update.message.reply_text(swaps_text, parse_mode=ParseMode.HTML, reply_markup=swaps_keyboard)
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ You're not authorized to do that.")
+        return
+
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "Usage: /broadcast <message>\ne.g. /broadcast Reminder — swap deadline is Friday!"
+        )
+        return
+
+    body = html.escape(parts[1].strip())
+    text = f"📢 <b>Announcement</b>\n\n{body}"
+
+    users = all_searching_users()
+    if not users:
+        await update.message.reply_text("No one is currently waiting for a swap — nothing to send.")
+        return
+
+    sent, failed = 0, 0
+    for u in users:
+        try:
+            await context.bot.send_message(chat_id=u["user_id"], text=text, parse_mode=ParseMode.HTML)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
+
+    report = f"📢 Broadcast sent to {sent} waiting user(s)."
+    if failed:
+        report += f" {failed} failed to deliver (likely blocked the bot)."
+    await update.message.reply_text(report)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_lines = (
+        "\n/restore — restore the DB from the last channel backup (admin only)"
+        "\n/broadcast <message> — message everyone currently waiting (admin only)"
+        if update.effective_user.id in ADMIN_IDS
+        else ""
+    )
     await update.message.reply_text(
         "/start — register or update your swap request\n"
         "/mystatus — check your current listing\n"
+        "/available_swaps — see swaps available for your current group\n"
         "/waitlist — see everyone currently waiting for a swap\n"
         "/cancel — withdraw your listing\n"
         "/help — this message"
-        + ("\n/restore — restore the DB from the last channel backup (admin only)"
-           if update.effective_user.id in ADMIN_IDS else "")
+        + admin_lines
     )
 
 
@@ -873,10 +1078,13 @@ def main():
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:\d+$"))
     app.add_handler(CallbackQueryHandler(cancel_match_callback, pattern=r"^cancel:\d+$"))
+    app.add_handler(CallbackQueryHandler(propose_callback, pattern=r"^propose:\d+$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
     app.add_handler(CommandHandler("mystatus", mystatus))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("waitlist", waitlist_command))
+    app.add_handler(CommandHandler("available_swaps", available_swaps_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore:"))
