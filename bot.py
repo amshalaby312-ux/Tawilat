@@ -1,7 +1,9 @@
+import json
 import logging
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -24,6 +26,16 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "swaps.db")
 GROUPS = [f"{n}{sub}" for n in range(1, 9) for sub in ("a", "b")]  # G1a, G1b, G2a, G2b, ... G8a, G8b
+
+# ---------------------------------------------------------------------------
+# Backup / restore
+# ---------------------------------------------------------------------------
+BACKUP_CHANNEL_ID = -1002891277206
+BACKUP_INTERVAL_SECONDS = 10
+BACKUP_FILENAME = "swaps_backup.json"
+ADMIN_IDS = {
+    int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "940770584").split(",") if uid.strip()
+}
 
 # Conversation states
 ASK_NAME, ASK_CURRENT, ASK_DESIRED = range(3)
@@ -253,6 +265,169 @@ def cancel_other_pending_matches(user_id, except_match_id):
         other_id = row["user_b"] if row["user_a"] == user_id else row["user_a"]
         cancelled.append(other_id)
     return cancelled
+
+
+def dump_state():
+    """Serialize the whole DB (users, desired_groups, matches) to a plain dict."""
+    with db() as conn:
+        users = [dict(r) for r in conn.execute("SELECT * FROM users")]
+        desired_groups = [dict(r) for r in conn.execute("SELECT * FROM desired_groups")]
+        matches = [dict(r) for r in conn.execute("SELECT * FROM matches")]
+    return {
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "users": users,
+        "desired_groups": desired_groups,
+        "matches": matches,
+    }
+
+
+def restore_state(data):
+    """Wipe the DB and reload it from a dict produced by dump_state(). Returns row counts."""
+    users = data.get("users", [])
+    desired_groups = data.get("desired_groups", [])
+    matches = data.get("matches", [])
+
+    with db() as conn:
+        conn.execute("DELETE FROM matches")
+        conn.execute("DELETE FROM desired_groups")
+        conn.execute("DELETE FROM users")
+
+        conn.executemany(
+            """
+            INSERT INTO users (user_id, full_name, username, current_group, status)
+            VALUES (:user_id, :full_name, :username, :current_group, :status)
+            """,
+            users,
+        )
+        conn.executemany(
+            "INSERT INTO desired_groups (user_id, group_id) VALUES (:user_id, :group_id)",
+            desired_groups,
+        )
+        conn.executemany(
+            """
+            INSERT INTO matches (match_id, user_a, user_b, a_confirmed, b_confirmed, status)
+            VALUES (:match_id, :user_a, :user_b, :a_confirmed, :b_confirmed, :status)
+            """,
+            matches,
+        )
+
+        # Keep the AUTOINCREMENT counter for matches ahead of any restored match_id,
+        # so newly created matches after a restore can't collide with old ones.
+        max_match_id = max((m["match_id"] for m in matches), default=0)
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'matches'")
+        if max_match_id:
+            conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('matches', ?)", (max_match_id,))
+
+    return {"users": len(users), "desired_groups": len(desired_groups), "matches": len(matches)}
+
+
+async def send_backup(bot):
+    """Dump the DB, post it to the backup channel, and (re)pin it as the latest backup."""
+    data = dump_state()
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    caption = (
+        f"🗄 Auto-backup — {len(data['users'])} users, {len(data['matches'])} matches\n"
+        f"{data['exported_at']}"
+    )
+    message = await bot.send_document(
+        chat_id=BACKUP_CHANNEL_ID,
+        document=payload,
+        filename=BACKUP_FILENAME,
+        caption=caption,
+        disable_notification=True,
+    )
+    try:
+        await bot.unpin_chat_message(chat_id=BACKUP_CHANNEL_ID)
+    except Exception:
+        pass  # nothing was pinned yet, or it was already unpinned
+    await bot.pin_chat_message(
+        chat_id=BACKUP_CHANNEL_ID, message_id=message.message_id, disable_notification=True
+    )
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await send_backup(context.bot)
+    except Exception:
+        logger.exception("Periodic backup to channel %s failed", BACKUP_CHANNEL_ID)
+
+
+async def fetch_pinned_backup(bot):
+    """Return the parsed JSON of the channel's currently pinned backup document, or None."""
+    chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+    pinned = chat.pinned_message
+    if not pinned or not pinned.document:
+        return None
+    file = await bot.get_file(pinned.document.file_id)
+    raw = await file.download_as_bytearray()
+    return json.loads(bytes(raw).decode("utf-8"))
+
+
+async def maybe_restore_on_startup(application):
+    """Called once before polling starts. Restores from the pinned backup only if the
+    local DB is empty (e.g. a redeploy wiped the disk) — never overwrites live data."""
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    if count > 0:
+        logger.info("Found %d existing user(s) locally — skipping startup restore.", count)
+        return
+    logger.info("No local data found — checking channel %s for a pinned backup...", BACKUP_CHANNEL_ID)
+    try:
+        data = await fetch_pinned_backup(application.bot)
+        if data is None:
+            logger.info("No pinned backup document found. Starting with an empty database.")
+            return
+        counts = restore_state(data)
+        logger.info("Restored from pinned backup (%s): %s", data.get("exported_at", "unknown time"), counts)
+    except Exception:
+        logger.exception("Startup restore failed — continuing with an empty database.")
+
+
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ You're not authorized to do that.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⚠️ Yes, overwrite the live database", callback_data="restore:confirm")],
+            [InlineKeyboardButton("Cancel", callback_data="restore:abort")],
+        ]
+    )
+    await update.message.reply_text(
+        "This will DELETE the current database and replace it with the last pinned "
+        "backup from the channel. Are you sure?",
+        reply_markup=keyboard,
+    )
+
+
+async def restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("⛔ Not authorized.", show_alert=True)
+        return
+
+    action = query.data.split(":")[1]
+    if action == "abort":
+        await query.answer("Cancelled.")
+        await query.edit_message_text("Restore cancelled.")
+        return
+
+    await query.answer("Restoring...")
+    try:
+        data = await fetch_pinned_backup(context.bot)
+        if data is None:
+            await query.edit_message_text("⚠️ No pinned backup document found in the channel.")
+            return
+        counts = restore_state(data)
+        await query.edit_message_text(
+            f"✅ Restored from backup ({data.get('exported_at', 'unknown time')}):\n"
+            f"{counts['users']} users, {counts['desired_groups']} desired-group entries, "
+            f"{counts['matches']} matches."
+        )
+    except Exception:
+        logger.exception("Manual restore failed")
+        await query.edit_message_text("❌ Restore failed — check the logs.")
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +845,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/waitlist — see everyone currently waiting for a swap\n"
         "/cancel — withdraw your listing\n"
         "/help — this message"
+        + ("\n/restore — restore the DB from the last channel backup (admin only)"
+           if update.effective_user.id in ADMIN_IDS else "")
     )
 
 
@@ -679,7 +856,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(maybe_restore_on_startup).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -701,6 +878,12 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("waitlist", waitlist_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("restore", restore_command))
+    app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore:"))
+
+    app.job_queue.run_repeating(
+        backup_job, interval=BACKUP_INTERVAL_SECONDS, first=BACKUP_INTERVAL_SECONDS
+    )
 
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
