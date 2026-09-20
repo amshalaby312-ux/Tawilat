@@ -98,6 +98,14 @@ def init_db():
             )
             """
         )
+        # Every user ID that ever registered. Survives /reset so /broadcast can still reach them.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS known_users (
+                user_id INTEGER PRIMARY KEY
+            )
+            """
+        )
 
         # One-time migration from the old single-desired-group schema.
         if _column_exists(conn, "users", "desired_group"):
@@ -127,6 +135,9 @@ def init_db():
             )
             conn.execute("DROP TABLE users_old")
             logger.info("Migrated users.desired_group into the desired_groups table.")
+
+        # Backfill: anyone already registered before known_users existed.
+        conn.execute("INSERT OR IGNORE INTO known_users (user_id) SELECT user_id FROM users")
 
 
 def get_user(user_id):
@@ -160,6 +171,7 @@ def upsert_user(user_id, full_name, username, current_group, desired_groups):
             """,
             (user_id, full_name, username, current_group),
         )
+        conn.execute("INSERT OR IGNORE INTO known_users (user_id) VALUES (?)", (user_id,))
         conn.execute("DELETE FROM desired_groups WHERE user_id = ?", (user_id,))
         conn.executemany(
             "INSERT INTO desired_groups (user_id, group_id) VALUES (?, ?)",
@@ -182,6 +194,55 @@ def all_searching_users():
         return conn.execute(
             "SELECT * FROM users WHERE status = 'searching' ORDER BY current_group, full_name"
         ).fetchall()
+
+
+# A user "on the waitlist" is still searching AND has no pending match offer.
+# Once someone finds a match they drop off the list; if the match is cancelled
+# they reappear automatically. (Confirmed swaps are status='matched', so they
+# are already excluded by the status check.)
+_NO_PENDING_MATCH = """
+    NOT EXISTS (
+        SELECT 1 FROM matches m
+        WHERE m.status = 'pending'
+          AND (m.user_a = u.user_id OR m.user_b = u.user_id)
+    )
+"""
+
+
+def waitlist_users():
+    with db() as conn:
+        return conn.execute(
+            f"""
+            SELECT u.* FROM users u
+            WHERE u.status = 'searching' AND {_NO_PENDING_MATCH}
+            ORDER BY u.current_group, u.full_name
+            """
+        ).fetchall()
+
+
+def groups_with_available_swap(user_id, current_group):
+    """Groups holding at least one waitlisted user who wants `current_group` —
+    i.e. picking that group as a target gives an immediate, mutual swap."""
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT u.current_group
+            FROM users u
+            JOIN desired_groups dg ON dg.user_id = u.user_id
+            WHERE u.status = 'searching'
+              AND u.user_id != ?
+              AND dg.group_id = ?
+              AND {_NO_PENDING_MATCH}
+            """,
+            (user_id, current_group),
+        ).fetchall()
+    return {r["current_group"] for r in rows}
+
+
+def all_known_user_ids():
+    with db() as conn:
+        rows = conn.execute("SELECT user_id FROM known_users ORDER BY user_id").fetchall()
+    return [r["user_id"] for r in rows]
 
 
 def find_reverse_candidates(user_id, current_group, desired_groups):
@@ -314,12 +375,14 @@ def dump_state():
         users = [dict(r) for r in conn.execute("SELECT * FROM users")]
         desired_groups = [dict(r) for r in conn.execute("SELECT * FROM desired_groups")]
         matches = [dict(r) for r in conn.execute("SELECT * FROM matches")]
+        known_users = [r["user_id"] for r in conn.execute("SELECT user_id FROM known_users")]
     return {
         "version": 1,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "users": users,
         "desired_groups": desired_groups,
         "matches": matches,
+        "known_users": known_users,
     }
 
 
@@ -328,11 +391,14 @@ def restore_state(data):
     users = data.get("users", [])
     desired_groups = data.get("desired_groups", [])
     matches = data.get("matches", [])
+    known_ids = {int(u["user_id"]) for u in users} | {int(k) for k in data.get("known_users", [])}
 
     with db() as conn:
         conn.execute("DELETE FROM matches")
         conn.execute("DELETE FROM desired_groups")
         conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM known_users")
+        conn.executemany("INSERT INTO known_users (user_id) VALUES (?)", [(k,) for k in known_ids])
 
         conn.executemany(
             """
@@ -361,6 +427,23 @@ def restore_state(data):
             conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('matches', ?)", (max_match_id,))
 
     return {"users": len(users), "desired_groups": len(desired_groups), "matches": len(matches)}
+
+
+def reset_state():
+    """Clear every listing, choice, wait-list entry and match (and the match id
+    counter). User IDs are kept in known_users so /broadcast still works.
+    Returns how many listings/matches were cleared and how many IDs are kept."""
+    with db() as conn:
+        # make sure every current user's ID is remembered before their rows go
+        conn.execute("INSERT OR IGNORE INTO known_users (user_id) SELECT user_id FROM users")
+        n_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        n_matches = conn.execute("SELECT COUNT(*) AS c FROM matches").fetchone()["c"]
+        conn.execute("DELETE FROM matches")
+        conn.execute("DELETE FROM desired_groups")
+        conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'matches'")
+        n_known = conn.execute("SELECT COUNT(*) AS c FROM known_users").fetchone()["c"]
+    return {"users": n_users, "matches": n_matches, "known": n_known}
 
 
 async def send_backup(bot):
@@ -471,6 +554,55 @@ async def restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Restore failed — check the logs.")
 
 
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ You're not authorized to do that.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⚠️ Yes, reset everything", callback_data="reset:confirm")],
+            [InlineKeyboardButton("Cancel", callback_data="reset:abort")],
+        ]
+    )
+    await update.message.reply_text(
+        "This will CLEAR every listing, choice, wait-list entry and match, for everyone. "
+        "User IDs are kept so /broadcast still reaches them. "
+        "The pinned channel backup will be replaced with the reset state too. Are you sure?",
+        reply_markup=keyboard,
+    )
+
+
+async def reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("⛔ Not authorized.", show_alert=True)
+        return
+
+    if query.data.split(":")[1] == "abort":
+        await query.answer("Cancelled.")
+        await query.edit_message_text("Reset cancelled.")
+        return
+
+    await query.answer("Resetting...")
+    try:
+        counts = reset_state()
+    except Exception:
+        logger.exception("Reset failed")
+        await query.edit_message_text("❌ Reset failed — check the logs.")
+        return
+
+    # Overwrite the pinned backup right away, so a restart can't restore the old data.
+    try:
+        await send_backup(context.bot)
+    except Exception:
+        logger.exception("Post-reset backup failed")
+
+    await query.edit_message_text(
+        f"✅ Reset done — {counts['users']} listings and {counts['matches']} matches cleared. "
+        f"{counts['known']} user IDs kept for /broadcast."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -491,14 +623,20 @@ def group_keyboard(prefix, exclude=None):
     return InlineKeyboardMarkup(buttons)
 
 
-def desired_group_keyboard(selected, exclude=None):
-    """Multi-select toggle keyboard (used for the 'desired groups' step)."""
+def desired_group_keyboard(selected, exclude=None, swap_groups=None):
+    """Multi-select toggle keyboard (used for the 'desired groups' step).
+    Groups in swap_groups get a 🔄 marker: a mutual swap is available there."""
+    swap_groups = swap_groups or set()
     buttons = []
     row = []
     for g in GROUPS:
         if g == exclude:
             continue
-        label = f"✅ G{g}" if g in selected else f"G{g}"
+        label = f"G{g}"
+        if g in swap_groups:
+            label += " 🔄"
+        if g in selected:
+            label = "✅ " + label
         row.append(InlineKeyboardButton(label, callback_data=f"des:{g}"))
         if len(row) == 4:
             buttons.append(row)
@@ -584,7 +722,7 @@ def build_available_swaps(user_id):
         lines.append("")
 
     if not mutual and not alternatives and not others:
-        waiting_count = len(all_searching_users())
+        waiting_count = len(waitlist_users())
         lines.append("there are no alternative groups currently, Sorry :/")
         lines.append(f"current number of people waiting: {waiting_count}")
 
@@ -676,11 +814,19 @@ async def ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = query.data.split(":")[1]
     context.user_data["current_group"] = group
     context.user_data["desired_groups"] = set()
+    swap_groups = groups_with_available_swap(query.from_user.id, group)
+    context.user_data["swap_groups"] = swap_groups
+
+    text = (
+        f"Current group set to G{group}.\n\n"
+        f"Which group(s) do you want to move to? Tap as many as you like, then tap Done."
+    )
+    if swap_groups:
+        text += "\n\n(there is a swap available in groups with this 🔄 emoji in their button)"
 
     await query.edit_message_text(
-        f"Current group set to G{group}.\n\n"
-        f"Which group(s) do you want to move to? Tap as many as you like, then tap Done.",
-        reply_markup=desired_group_keyboard(set(), exclude=group),
+        text,
+        reply_markup=desired_group_keyboard(set(), exclude=group, swap_groups=swap_groups),
     )
     return ASK_DESIRED
 
@@ -728,7 +874,11 @@ async def ask_desired(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         selected.add(g)
     await query.answer()
-    await query.edit_message_reply_markup(desired_group_keyboard(selected, exclude=current_group))
+    await query.edit_message_reply_markup(
+        desired_group_keyboard(
+            selected, exclude=current_group, swap_groups=context.user_data.get("swap_groups", set())
+        )
+    )
     return ASK_DESIRED
 
 
@@ -964,7 +1114,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_waitlist(chat_id, context: ContextTypes.DEFAULT_TYPE):
     """Builds and sends the current wait list to chat_id, splitting into multiple
     messages if the content would exceed Telegram's ~4096 character limit."""
-    users = all_searching_users()
+    users = waitlist_users()
     if not users:
         await context.bot.send_message(chat_id=chat_id, text="No one is currently waiting for a swap. 🎉")
         return
@@ -1019,21 +1169,21 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     body = html.escape(parts[1].strip())
     text = f"📢 <b>Announcement</b>\n\n{body}"
 
-    users = all_searching_users()
-    if not users:
-        await update.message.reply_text("No one is currently waiting for a swap — nothing to send.")
+    user_ids = all_known_user_ids()
+    if not user_ids:
+        await update.message.reply_text("No registered users yet — nothing to send.")
         return
 
     sent, failed = 0, 0
-    for u in users:
+    for uid in user_ids:
         try:
-            await context.bot.send_message(chat_id=u["user_id"], text=text, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
             sent += 1
         except Exception:
             failed += 1
         await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
 
-    report = f"📢 Broadcast sent to {sent} waiting user(s)."
+    report = f"📢 Broadcast sent to {sent} user(s)."
     if failed:
         report += f" {failed} failed to deliver (likely blocked the bot)."
     await update.message.reply_text(report)
@@ -1042,7 +1192,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_lines = (
         "\n/restore — restore the DB from the last channel backup (admin only)"
-        "\n/broadcast <message> — message everyone currently waiting (admin only)"
+        "\n/reset — clear all listings, choices and matches; keeps user IDs (admin only)"
+        "\n/broadcast <message> — message everyone who has registered (admin only)"
         if update.effective_user.id in ADMIN_IDS
         else ""
     )
@@ -1090,6 +1241,8 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore:"))
+    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CallbackQueryHandler(reset_callback, pattern=r"^reset:"))
 
     app.job_queue.run_repeating(
         backup_job, interval=BACKUP_INTERVAL_SECONDS, first=BACKUP_INTERVAL_SECONDS
