@@ -1192,11 +1192,41 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report)
 
 
+async def tell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tell <user_id> <message> — admin sends one user a direct message."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ You're not authorized to do that.")
+        return
+
+    parts = update.message.text.split(maxsplit=2)
+    usage = "Usage: /tell <user_id> <message>\ne.g. /tell 123456789 Please confirm your swap"
+    if len(parts) < 3 or not parts[2].strip():
+        await update.message.reply_text(usage)
+        return
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text(f"❌ '{parts[1]}' isn't a valid user ID.\n\n{usage}")
+        return
+
+    try:
+        # plain text on purpose (no parse_mode): the message goes out exactly as typed
+        await context.bot.send_message(chat_id=target_id, text=f"رد ضروري: {parts[2].strip()}")
+    except Exception as e:
+        logger.warning("/tell to %s failed: %s", target_id, e)
+        await update.message.reply_text(
+            f"❌ Couldn't deliver to {target_id} (they may have blocked the bot or never started it)."
+        )
+        return
+    await update.message.reply_text(f"✅ Sent to {target_id}.")
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_lines = (
         "\n/restore — restore the DB from the last channel backup (admin only)"
         "\n/reset — clear all listings, choices and matches; keeps user IDs (admin only)"
         "\n/broadcast <message> — message everyone who has registered (admin only)"
+        "\n/tell <user_id> <message> — message one user (admin only)"
         if update.effective_user.id in ADMIN_IDS
         else ""
     )
@@ -1241,6 +1271,7 @@ def main():
     app.add_handler(CommandHandler("waitlist", waitlist_command))
     app.add_handler(CommandHandler("available_swaps", available_swaps_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("tell", tell_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore:"))
