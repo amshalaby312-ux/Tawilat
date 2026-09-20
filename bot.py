@@ -671,45 +671,48 @@ def status_text(user_row, desired_groups):
 
 def build_available_swaps(user_id):
     """Build an 'Available Swaps' summary for this user's current group, plus an
-    inline keyboard of 🔁 propose buttons for alternative swaps. Returns
-    (text, keyboard_or_None), or (None, None) if the user isn't an active listing."""
+    inline keyboard with one 🔄 button per available swap. An available swap is any
+    waiting user who wants this user's current group, whether or not their own group
+    is one this user listed. Returns (text, keyboard_or_None), or (None, None) if the
+    user isn't an active listing."""
     row = get_user(user_id)
     if not row or row["status"] != "searching":
         return None, None
 
     desired_groups = get_desired_groups(user_id)
-    mutual = find_reverse_candidates(user_id, row["current_group"], desired_groups)
-    mutual_ids = {c["user_id"] for c in mutual}
 
-    reciprocal = find_reciprocal_seekers(user_id, row["current_group"])
-    alternatives = [
-        u for u in reciprocal
-        if u["user_id"] not in mutual_ids and u["current_group"] not in desired_groups
+    # Same rule as the 🔄 markers in the group picker: they want my spot, and they
+    # haven't already found a match with someone else. (A pending match with *me*
+    # stays visible, shown as pending.)
+    swaps = [
+        u for u in find_reciprocal_seekers(user_id, row["current_group"])
+        if existing_pending_match(user_id, u["user_id"]) or not pending_matches_for_user(u["user_id"])
     ]
+    swap_ids = {u["user_id"] for u in swaps}
 
-    others = [u for u in users_in_groups(user_id, desired_groups) if u["user_id"] not in mutual_ids]
+    others = [u for u in users_in_groups(user_id, desired_groups) if u["user_id"] not in swap_ids]
 
     lines = [f"🔄 <b>Available swaps for G{row['current_group']} ➜ {groups_str(desired_groups)}</b>", ""]
     buttons = []
 
-    if mutual:
-        lines.append("✅ <b>Direct matches</b> — they want your spot too:")
-        for c in mutual:
-            lines.append(f"• {mention(c['full_name'], c['user_id'], c['username'])} — has G{c['current_group']}")
-        lines.append("")
-
-    if alternatives:
-        lines.append(
-            "🔁 <b>Alternative swaps</b> — you didn't ask for these, but they want your spot:"
-        )
-        for u in alternatives:
+    if swaps:
+        lines.append("🔄 <b>Available swaps</b> — they want your spot:")
+        for u in swaps:
             lines.append(f"• {mention(u['full_name'], u['user_id'], u['username'])} — has G{u['current_group']}")
-            buttons.append(
-                [InlineKeyboardButton(
-                    f"🔁 Propose swap into G{u['current_group']} ({u['full_name']})",
-                    callback_data=f"propose:{u['user_id']}",
-                )]
-            )
+            if existing_pending_match(user_id, u["user_id"]):
+                buttons.append(
+                    [InlineKeyboardButton(
+                        f"⏳ Match pending — G{u['current_group']} ({u['full_name']})",
+                        callback_data="noop",
+                    )]
+                )
+            else:
+                buttons.append(
+                    [InlineKeyboardButton(
+                        f"🔄 Propose swap into G{u['current_group']} ({u['full_name']})",
+                        callback_data=f"propose:{u['user_id']}",
+                    )]
+                )
         lines.append("")
 
     if others:
@@ -721,7 +724,7 @@ def build_available_swaps(user_id):
             )
         lines.append("")
 
-    if not mutual and not alternatives and not others:
+    if not swaps and not others:
         waiting_count = len(waitlist_users())
         lines.append("there are no alternative groups currently, Sorry :/")
         lines.append(f"current number of people waiting: {waiting_count}")
@@ -758,7 +761,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_row and user_row["status"] == "matched":
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("🔁 Register a new swap", callback_data="menu:edit")],
+                [InlineKeyboardButton("🔄 Register a new swap", callback_data="menu:edit")],
                 [InlineKeyboardButton("📋 Waitlist", callback_data="menu:waitlist")],
             ]
         )
@@ -936,7 +939,7 @@ async def send_match_notification(context, match_id, to_user_id, other_full_name
 
 
 async def propose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fired when a user taps a 🔁 button on an alternative swap surfaced by
+    """Fired when a user taps a 🔄 button on an available swap surfaced by
     /available_swaps — creates a real pending match, same as an automatic one."""
     query = update.callback_query
     other_id = int(query.data.split(":")[1])
