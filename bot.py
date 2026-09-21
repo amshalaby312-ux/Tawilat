@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "swaps.db")
-GROUPS = [f"{n}{sub}" for n in range(1, 9) for sub in ("a", "b")]  # G1a, G1b, G2a, G2b, ... G8a, G8b
+GROUPS = [str(n) for n in range(1, 11)]  # G1 ... G10
 
 # ---------------------------------------------------------------------------
 # Backup / restore
@@ -150,7 +150,7 @@ def get_user(user_id):
 def get_desired_groups(user_id):
     with db() as conn:
         rows = conn.execute(
-            "SELECT group_id FROM desired_groups WHERE user_id = ? ORDER BY group_id",
+            "SELECT group_id FROM desired_groups WHERE user_id = ? ORDER BY CAST(group_id AS INTEGER)",
             (user_id,),
         ).fetchall()
     return [r["group_id"] for r in rows]
@@ -192,7 +192,7 @@ def delete_user(user_id):
 def all_searching_users():
     with db() as conn:
         return conn.execute(
-            "SELECT * FROM users WHERE status = 'searching' ORDER BY current_group, full_name"
+            "SELECT * FROM users WHERE status = 'searching' ORDER BY CAST(current_group AS INTEGER), full_name"
         ).fetchall()
 
 
@@ -215,7 +215,7 @@ def waitlist_users():
             f"""
             SELECT u.* FROM users u
             WHERE u.status = 'searching' AND {_NO_PENDING_MATCH}
-            ORDER BY u.current_group, u.full_name
+            ORDER BY CAST(u.current_group AS INTEGER), u.full_name
             """
         ).fetchall()
 
@@ -282,7 +282,7 @@ def find_reciprocal_seekers(user_id, current_group):
             WHERE u.status = 'searching'
               AND u.user_id != ?
               AND dg.group_id = ?
-            ORDER BY u.current_group, u.full_name
+            ORDER BY CAST(u.current_group AS INTEGER), u.full_name
             """,
             (user_id, current_group),
         ).fetchall()
@@ -301,7 +301,7 @@ def users_in_groups(exclude_user_id, group_ids):
             WHERE status = 'searching'
               AND user_id != ?
               AND current_group IN ({placeholders})
-            ORDER BY current_group, full_name
+            ORDER BY CAST(current_group AS INTEGER), full_name
             """,
             (exclude_user_id, *group_ids),
         ).fetchall()
@@ -846,7 +846,7 @@ async def ask_desired(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ASK_DESIRED
 
         await query.answer()
-        desired_groups = sorted(selected)
+        desired_groups = sorted(selected, key=int)
         full_name = context.user_data["full_name"]
         user = query.from_user
         upsert_user(user.id, full_name, user.username, current_group, desired_groups)
@@ -1253,8 +1253,8 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-            ASK_CURRENT: [CallbackQueryHandler(ask_current, pattern=r"^cur:[1-8][ab]$")],
-            ASK_DESIRED: [CallbackQueryHandler(ask_desired, pattern=r"^des:([1-8][ab]|done)$")],
+            ASK_CURRENT: [CallbackQueryHandler(ask_current, pattern=r"^cur:([1-9]|10)$")],
+            ASK_DESIRED: [CallbackQueryHandler(ask_desired, pattern=r"^des:([1-9]|10|done)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
         per_message=False,
