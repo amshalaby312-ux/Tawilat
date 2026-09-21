@@ -25,6 +25,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+GREEN = "\033[1;32m"
+RESET = "\033[0m"
+ONLINE_BANNER = r"""
+ ██████╗ ███╗   ██╗██╗     ██╗███╗   ██╗███████╗
+██╔═══██╗████╗  ██║██║     ██║████╗  ██║██╔════╝
+██║   ██║██╔██╗ ██║██║     ██║██╔██╗ ██║█████╗
+██║   ██║██║╚██╗██║██║     ██║██║╚██╗██║██╔══╝
+╚██████╔╝██║ ╚████║███████╗██║██║ ╚████║███████╗
+ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
+"""
+
+
+def print_online_banner():
+    try:
+        print(f"{GREEN}{ONLINE_BANNER}{RESET}", flush=True)
+    except UnicodeEncodeError:
+        # terminal can't render the block characters — fall back to plain text
+        print(f"{GREEN}=== ONLINE ==={RESET}", flush=True)
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "swaps.db")
 GROUPS = [str(n) for n in range(1, 11)]  # G1 ... G10
@@ -1245,9 +1264,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # App
 # ---------------------------------------------------------------------------
 
+async def on_startup(application):
+    await maybe_restore_on_startup(application)
+    print_online_banner()
+
+
 def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).post_init(maybe_restore_on_startup).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
