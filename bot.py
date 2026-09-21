@@ -52,7 +52,7 @@ GROUPS = [str(n) for n in range(1, 11)]  # G1 ... G10
 # Backup / restore
 # ---------------------------------------------------------------------------
 BACKUP_CHANNEL_ID = -1002891277206
-BACKUP_INTERVAL_SECONDS = 10
+BACKUP_INTERVAL_SECONDS = 30
 BACKUP_FILENAME = "swaps_backup.json"
 ADMIN_IDS = {
     int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "940770584").split(",") if uid.strip()
